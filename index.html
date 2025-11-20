@@ -1,0 +1,323 @@
+import React, { useState } from "react";
+/*
+  RecruitmentApp.jsx
+  Single-file React component (Tailwind CSS classes) for a recruitment website.
+
+  Requirements implemented:
+  - Page 1: Welcome + "Mulai Mendaftar" button
+  - Page 2: Personal information form (answers recorded)
+  - Page 3: Position & experience form (select options can be filled later)
+  - Page 4: File uploads (KTP, KK) that are uploaded to cloud (Firebase Storage)
+  - Final: Saves all data to Firestore and returns success message
+
+  Setup notes (replace placeholders):
+  1) Create a Firebase project at https://console.firebase.google.com/
+  2) Enable Firestore (in Native mode) and Firebase Storage (set rules appropriately for testing)
+  3) Replace the firebaseConfig object below with your project's config.
+  4) Install dependencies (when using a bundler / CRA / Vite):
+     npm install firebase react react-dom
+  5) Add Tailwind CSS to your project to make styling work, or adapt classes.
+  6) To add actual position options, modify `positionOptions` (or fetch from Firestore/admin later).
+
+  This component is ready to be dropped into a React app. It focuses on clarity and functionality,
+  and avoids third-party UI libs so it runs without extra configuration.
+*/
+
+// ---------- FIREBASE SETUP (REPLACE VALUES) ----------
+import { initializeApp } from "firebase/app";
+import { getFirestore, collection, addDoc, serverTimestamp } from "firebase/firestore";
+import { getStorage, ref as storageRef, uploadBytes, getDownloadURL } from "firebase/storage";
+
+const firebaseConfig = {
+  apiKey: "YOUR_API_KEY",
+  authDomain: "YOUR_AUTH_DOMAIN",
+  projectId: "YOUR_PROJECT_ID",
+  storageBucket: "YOUR_STORAGE_BUCKET",
+  messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
+  appId: "YOUR_APP_ID",
+};
+
+// Initialize Firebase
+let app, db, storage;
+try {
+  app = initializeApp(firebaseConfig);
+  db = getFirestore(app);
+  storage = getStorage(app);
+} catch (err) {
+  // If firebase already initialized in the environment, this will be okay.
+  console.warn("Firebase init warning:", err?.message || err);
+}
+
+// ---------- MAIN COMPONENT ----------
+export default function RecruitmentApp() {
+  const [step, setStep] = useState(1);
+
+  // Personal info (page 2)
+  const [personal, setPersonal] = useState({
+    fullName: "",
+    email: "",
+    phone: "",
+    address: "",
+    birthDate: "",
+  });
+
+  // Position & experience (page 3)
+  const [position, setPosition] = useState({
+    positionApplied: "",
+    experienceYears: "",
+    previousCompany: "",
+    notes: "",
+  });
+
+  // Uploads (page 4)
+  const [files, setFiles] = useState({
+    ktp: null,
+    kk: null,
+  });
+
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState("");
+
+  // TODO: replace with dynamic list later. User said will provide positions afterwards.
+  const positionOptions = [
+    "-- Pilih posisi --",
+    "Operator Produksi",
+    "Quality Control",
+    "Teknisi",
+    "HR",
+    "Administrasi",
+  ];
+
+  function handlePersonalChange(e) {
+    setPersonal({ ...personal, [e.target.name]: e.target.value });
+  }
+
+  function handlePositionChange(e) {
+    setPosition({ ...position, [e.target.name]: e.target.value });
+  }
+
+  function handleFileChange(e) {
+    const { name, files: f } = e.target;
+    setFiles({ ...files, [name]: f[0] || null });
+  }
+
+  function validateStep2() {
+    return personal.fullName && personal.email && personal.phone;
+  }
+
+  function validateStep3() {
+    return position.positionApplied && position.positionApplied !== "-- Pilih posisi --";
+  }
+
+  function validateFiles() {
+    return files.ktp && files.kk;
+  }
+
+  async function uploadFile(file, applicantId, kind) {
+    if (!storage) throw new Error("Firebase Storage is not initialized. Add config.");
+    const fileName = `${applicantId}_${kind}_${Date.now()}_${file.name}`;
+    const ref = storageRef(storage, `applications/${applicantId}/${fileName}`);
+    const snapshot = await uploadBytes(ref, file);
+    const url = await getDownloadURL(snapshot.ref);
+    return url;
+  }
+
+  async function handleSubmitAll() {
+    setLoading(true);
+    setMessage("");
+    try {
+      const docRef = await addDoc(collection(db, "applications"), {
+        personal,
+        position,
+        createdAt: serverTimestamp(),
+        status: "submitted",
+      });
+      const applicantId = docRef.id;
+
+      const uploaded = {};
+      if (files.ktp) uploaded.ktp = await uploadFile(files.ktp, applicantId, "ktp");
+      if (files.kk) uploaded.kk = await uploadFile(files.kk, applicantId, "kk");
+
+      await addDoc(collection(db, `applications/${applicantId}/uploads`), {
+        ...uploaded,
+        uploadedAt: serverTimestamp(),
+      });
+
+      // ---- Create PDF ----
+      const { jsPDF } = await import("jspdf");
+      const pdf = new jsPDF();
+      pdf.setFontSize(14);
+      pdf.text("Bukti Pendaftaran Rekrutmen", 10, 15);
+      pdf.setFontSize(10);
+      pdf.text(`ID Pelamar: ${applicantId}`, 10, 25);
+
+      pdf.text("-- Data Pribadi --", 10, 40);
+      Object.entries(personal).forEach(([k, v], i) => {
+        pdf.text(`${k}: ${v}`, 10, 50 + i * 6);
+      });
+
+      const startY = 50 + Object.keys(personal).length * 6 + 10;
+      pdf.text("-- Detail Lamaran --", 10, startY);
+      Object.entries(position).forEach(([k, v], i) => {
+        pdf.text(`${k}: ${v}`, 10, startY + 10 + i * 6);
+      });
+
+      const finalY = startY + 10 + Object.keys(position).length * 6 + 10;
+      pdf.text("File Upload:", 10, finalY);
+      pdf.text(`KTP: ${uploaded.ktp || "Tidak ada"}`, 10, finalY + 10);
+      pdf.text(`KK: ${uploaded.kk || "Tidak ada"}`, 10, finalY + 16);
+
+      // Save PDF locally for user
+      pdf.save(`bukti_pendaftaran_${personal.fullName}.pdf`);
+
+      setMessage("Lamaran berhasil dikirim dan PDF telah dibuat!");
+      setStep(5);
+    } catch (err) {
+      console.error(err);
+      setMessage("Terjadi kesalahan: " + (err.message || String(err)));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // Small presentational components
+  function Field({ label, children }) {
+    return (
+      <label className="block mb-3">
+        <div className="text-sm font-medium mb-1">{label}</div>
+        {children}
+      </label>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
+      <div className="w-full max-w-3xl bg-white rounded-2xl shadow-md p-8">
+        {/* Header */}
+        <header className="mb-6">
+          <h1 className="text-2xl font-bold">PT Kalimantan Alumina Nusantara - Rekrutmen</h1>
+          <p className="text-sm text-slate-600">Form pendaftaran online karyawan baru</p>
+        </header>
+
+        {/* Steps UI */}
+        <div className="mb-6 flex gap-3 text-xs">
+          <div className={`px-3 py-1 rounded-full ${step === 1 ? "bg-blue-600 text-white" : "bg-slate-100 text-slate-600"}`}>1. Selamat Datang</div>
+          <div className={`px-3 py-1 rounded-full ${step === 2 ? "bg-blue-600 text-white" : "bg-slate-100 text-slate-600"}`}>2. Informasi Pribadi</div>
+          <div className={`px-3 py-1 rounded-full ${step === 3 ? "bg-blue-600 text-white" : "bg-slate-100 text-slate-600"}`}>3. Posisi & Pengalaman</div>
+          <div className={`px-3 py-1 rounded-full ${step === 4 ? "bg-blue-600 text-white" : "bg-slate-100 text-slate-600"}`}>4. Upload Dokumen</div>
+          <div className={`px-3 py-1 rounded-full ${step === 5 ? "bg-green-600 text-white" : "bg-slate-100 text-slate-600"}`}>5. Selesai</div>
+        </div>
+
+        {/* CONTENT */}
+        <main>
+          {step === 1 && (
+            <section>
+              <h2 className="text-xl font-semibold mb-3">Selamat datang di proses rekrutmen</h2>
+              <p className="mb-6">Terima kasih atas ketertarikan Anda untuk bergabung dengan PT Kalimantan Alumina Nusantara. Silakan klik tombol di bawah untuk memulai pendaftaran.</p>
+              <button className="px-5 py-2 rounded-lg bg-blue-600 text-white" onClick={() => setStep(2)}>
+                Mulai Mendaftar
+              </button>
+            </section>
+          )}
+
+          {step === 2 && (
+            <section>
+              <h2 className="text-lg font-semibold mb-3">Informasi Pribadi</h2>
+              <form onSubmit={(e) => { e.preventDefault(); if (validateStep2()) setStep(3); else setMessage('Lengkapi nama, email, telepon.'); }}>
+                <Field label="Nama Lengkap">
+                  <input name="fullName" value={personal.fullName} onChange={handlePersonalChange} className="w-full border rounded px-3 py-2" />
+                </Field>
+                <Field label="Email">
+                  <input name="email" value={personal.email} onChange={handlePersonalChange} type="email" className="w-full border rounded px-3 py-2" />
+                </Field>
+                <Field label="Telepon">
+                  <input name="phone" value={personal.phone} onChange={handlePersonalChange} className="w-full border rounded px-3 py-2" />
+                </Field>
+                <Field label="Alamat">
+                  <input name="address" value={personal.address} onChange={handlePersonalChange} className="w-full border rounded px-3 py-2" />
+                </Field>
+                <Field label="Tanggal Lahir">
+                  <input name="birthDate" value={personal.birthDate} onChange={handlePersonalChange} type="date" className="w-full border rounded px-3 py-2" />
+                </Field>
+
+                <div className="flex gap-3 mt-4">
+                  <button type="button" className="px-4 py-2 rounded border" onClick={() => setStep(1)}>Kembali</button>
+                  <button type="submit" className="px-4 py-2 rounded bg-blue-600 text-white">Lanjut</button>
+                </div>
+              </form>
+            </section>
+          )}
+
+          {step === 3 && (
+            <section>
+              <h2 className="text-lg font-semibold mb-3">Posisi & Pengalaman</h2>
+              <form onSubmit={(e) => { e.preventDefault(); if (validateStep3()) setStep(4); else setMessage('Pilih posisi yang dilamar.'); }}>
+                <Field label="Posisi yang dilamar">
+                  <select name="positionApplied" value={position.positionApplied} onChange={handlePositionChange} className="w-full border rounded px-3 py-2">
+                    {positionOptions.map((p) => <option key={p} value={p}>{p}</option>)}
+                  </select>
+                </Field>
+
+                <Field label="Lama pengalaman (tahun)">
+                  <input name="experienceYears" value={position.experienceYears} onChange={handlePositionChange} className="w-full border rounded px-3 py-2" />
+                </Field>
+
+                <Field label="Perusahaan sebelumnya">
+                  <input name="previousCompany" value={position.previousCompany} onChange={handlePositionChange} className="w-full border rounded px-3 py-2" />
+                </Field>
+
+                <Field label="Catatan tambahan">
+                  <textarea name="notes" value={position.notes} onChange={handlePositionChange} className="w-full border rounded px-3 py-2" rows={4} />
+                </Field>
+
+                <div className="flex gap-3 mt-4">
+                  <button type="button" className="px-4 py-2 rounded border" onClick={() => setStep(2)}>Kembali</button>
+                  <button type="submit" className="px-4 py-2 rounded bg-blue-600 text-white">Lanjut ke Upload</button>
+                </div>
+              </form>
+            </section>
+          )}
+
+          {step === 4 && (
+            <section>
+              <h2 className="text-lg font-semibold mb-3">Upload Dokumen</h2>
+              <p className="text-sm text-slate-600 mb-4">Unggah file KTP dan KK. File akan disimpan di cloud storage (Firebase Storage). Pastikan format JPG/PNG/PDF dan ukuran wajar.</p>
+
+              <Field label="KTP (foto atau scan)">
+                <input name="ktp" type="file" accept="image/*,.pdf" onChange={handleFileChange} />
+              </Field>
+
+              <Field label="KK (foto atau scan)">
+                <input name="kk" type="file" accept="image/*,.pdf" onChange={handleFileChange} />
+              </Field>
+
+              <div className="flex gap-3 mt-4">
+                <button type="button" className="px-4 py-2 rounded border" onClick={() => setStep(3)}>Kembali</button>
+                <button type="button" disabled={loading} onClick={() => { if (!validateFiles()) setMessage('Unggah KTP dan KK terlebih dahulu.'); else handleSubmitAll(); }} className={`px-4 py-2 rounded ${loading ? 'opacity-60' : 'bg-blue-600 text-white'}`}>
+                  {loading ? 'Mengirim...' : 'Kirim Lamaran'}
+                </button>
+              </div>
+
+              {message && <div className="mt-4 p-3 bg-yellow-50 border rounded">{message}</div>}
+            </section>
+          )}
+
+          {step === 5 && (
+            <section>
+              <h2 className="text-xl font-semibold mb-3">Terima kasih!</h2>
+              <p className="mb-4">Lamaran Anda telah diterima. Kami akan menghubungi jika ada tahapan lanjutan.</p>
+              <button className="px-4 py-2 rounded bg-blue-600 text-white" onClick={() => { setStep(1); setPersonal({ fullName: "", email: "", phone: "", address: "", birthDate: "" }); setPosition({ positionApplied: "", experienceYears: "", previousCompany: "", notes: "" }); setFiles({ ktp: null, kk: null }); setMessage(""); }}>
+                Kembali ke Halaman Utama
+              </button>
+            </section>
+          )}
+
+          {/* Generic error/message */}
+          {step !== 5 && message && step !== 4 && <div className="mt-4 p-3 bg-yellow-50 border rounded">{message}</div>}
+        </main>
+
+        <footer className="mt-6 text-xs text-slate-500">Catatan: Ini adalah template. Pastikan mengganti konfigurasi Firebase dengan milik perusahaan dan periksa aturan keamanan Storage & Firestore sebelum live.</footer>
+      </div>
+    </div>
+  );
+}
